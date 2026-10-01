@@ -1,0 +1,132 @@
+name: Backport BPF to kernel
+
+# Put this file in: .github/workflows/backport-bpf.yml
+# Source of the commits (default): Android Common Kernel
+#   https://android.googlesource.com/kernel/common
+# Alternative: upstream stable
+#   https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "Your kernel repo URL (the 5.4 one)"
+        required: true
+        default: "https://github.com/USER/android_kernel_DEVICE"
+      kernel_branch:
+        description: "Your kernel branch"
+        required: true
+        default: "main"
+      source_repo:
+        description: "Repo to take BPF commits from"
+        required: true
+        default: "https://android.googlesource.com/kernel/common"
+      source_branch:
+        description: "Branch in source repo (e.g. android12-5.10, android13-5.15)"
+        required: true
+        default: "android12-5.10"
+      commits:
+        description: "Commit SHAs to cherry-pick, oldest first, space separated (empty = only list candidates)"
+        required: false
+        default: ""
+      defconfig:
+        description: "Device defconfig (e.g. vendor/kona-perf_defconfig)"
+        required: true
+        default: "vendor/kona-perf_defconfig"
+      build_kernel:
+        description: "Try building the kernel after the backport"
+        type: boolean
+        default: false
+
+jobs:
+  backport:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git clang lld llvm bc bison flex libssl-dev \
+            libelf-dev make gcc-aarch64-linux-gnu python3 cpio xz-utils
+
+      - name: Clone your kernel
+        run: |
+          git clone --branch "${{ inputs.kernel_branch }}" "${{ inputs.kernel_repo }}" kernel
+          cd kernel
+          git config user.name  "bpf-backport"
+          git config user.email "bpf-backport@example.com"
+          make -s kernelversion || true
+
+      - name: Fetch source branch (history, no blobs)
+        working-directory: kernel
+        run: |
+          git remote add src "${{ inputs.source_repo }}"
+          git fetch --filter=blob:none src "${{ inputs.source_branch }}"
+
+      - name: Check BPF config options
+        working-directory: kernel
+        run: |
+          make O=out ARCH=arm64 LLVM=1 "${{ inputs.defconfig }}" || make O=out ARCH=arm64 "${{ inputs.defconfig }}"
+          : > ../config-report.txt
+          for o in BPF BPF_SYSCALL BPF_JIT BPF_JIT_ALWAYS_ON CGROUP_BPF \
+                   NET_CLS_BPF NET_ACT_BPF NETFILTER_XT_MATCH_BPF \
+                   BPF_STREAM_PARSER XDP_SOCKETS DEBUG_INFO_BTF; do
+            v=$(grep -E "^CONFIG_${o}=|^# CONFIG_${o} is not set" out/.config || echo "CONFIG_${o} MISSING")
+            echo "$v" | tee -a ../config-report.txt
+          done
+
+      - name: List candidate BPF commits (touching kernel/bpf, filter.c)
+        working-directory: kernel
+        run: |
+          base=$(git merge-base HEAD FETCH_HEAD || true)
+          if [ -n "$base" ]; then
+            git log --oneline --no-merges "$base"..FETCH_HEAD -- \
+              kernel/bpf include/linux/bpf.h include/uapi/linux/bpf.h \
+              net/core/filter.c tools/lib/bpf > ../candidates.txt || true
+          else
+            echo "No common ancestor found; list candidates manually from source repo." > ../candidates.txt
+          fi
+          wc -l ../candidates.txt
+
+      - name: Cherry-pick selected commits
+        if: ${{ inputs.commits != '' }}
+        working-directory: kernel
+        run: |
+          : > ../backport-report.txt
+          for c in ${{ inputs.commits }}; do
+            if git cherry-pick -x "$c"; then
+              echo "OK        $c" >> ../backport-report.txt
+            else
+              echo "CONFLICT  $c (skipped, fix by hand)" >> ../backport-report.txt
+              git cherry-pick --abort || true
+            fi
+          done
+          cat ../backport-report.txt
+          mkdir -p ../patches
+          git format-patch -o ../patches "origin/${{ inputs.kernel_branch }}..HEAD" || true
+
+      - name: Build kernel (optional)
+        if: ${{ inputs.build_kernel }}
+        working-directory: kernel
+        run: |
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- "${{ inputs.defconfig }}"
+          make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- 2>&1 | tee ../build.log
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bpf-backport-results
+          path: |
+            config-report.txt
+            candidates.txt
+            backport-report.txt
+            build.log
+            patches/
+          if-no-files-found: ignore
