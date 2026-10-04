@@ -1,0 +1,209 @@
+name: Build Kernel + Ubuntu-Chroot configs
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "اسم defconfig (اتركه فارغاً للكشف التلقائي عن 9230)"
+        required: false
+        default: ""
+      extra_fragments:
+        description: "ملفات config إضافية مفصولة بمسافة (مثل sprd-diffconfig/xxx)"
+        required: false
+        default: ""
+      strict:
+        description: "افشل البناء إذا لم تتفعّل أي خيارة من خيارات الشروت"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h /
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: SPEEDFIRE7/kernel_transsion_ums9230
+          ref: master
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm bc bison flex libssl-dev libelf-dev \
+            make cpio zip python3 \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+          clang --version | head -n1
+
+      - name: Create Ubuntu-Chroot config fragment
+        run: |
+          cat > chroot.config <<'EOF'
+          # Ubuntu-Chroot kernel config (ravindu644/Ubuntu-Chroot)
+
+          # 01. Namespaces (CONFIG_MNT_NS غير موجود كرمز في 5.4، mount ns جزء من NAMESPACES)
+          CONFIG_NAMESPACES=y
+          CONFIG_PID_NS=y
+          CONFIG_UTS_NS=y
+          CONFIG_IPC_NS=y
+
+          # 02. Essential filesystems
+          CONFIG_PROC_FS=y
+          CONFIG_SYSFS=y
+          CONFIG_DEVTMPFS=y
+          CONFIG_DEVTMPFS_MOUNT=y
+          CONFIG_TMPFS=y
+          CONFIG_TMPFS_POSIX_ACL=y
+          CONFIG_TMPFS_XATTR=y
+          CONFIG_EXT4_FS=y
+          CONFIG_EXT4_FS_POSIX_ACL=y
+          CONFIG_EXT4_FS_SECURITY=y
+
+          # 03. x86_64 emulation (QEMU binfmt)
+          CONFIG_BINFMT_MISC=y
+          CONFIG_BINFMT_SCRIPT=y
+          CONFIG_BINFMT_ELF=y
+
+          # Terminal
+          CONFIG_TTY=y
+          CONFIG_UNIX98_PTYS=y
+          CONFIG_DEVPTS_FS=y
+          CONFIG_LEGACY_PTYS=y
+          CONFIG_LEGACY_PTY_COUNT=256
+
+          # Networking basics
+          CONFIG_NET=y
+          CONFIG_INET=y
+          CONFIG_UNIX=y
+          CONFIG_IPV6=y
+          CONFIG_PACKET=y
+
+          # Core features
+          CONFIG_FUTEX=y
+          CONFIG_FILE_LOCKING=y
+          CONFIG_EPOLL=y
+          CONFIG_EVENTFD=y
+          CONFIG_SIGNALFD=y
+          CONFIG_TIMERFD=y
+          CONFIG_INOTIFY_USER=y
+          CONFIG_SECCOMP=y
+          CONFIG_SECCOMP_FILTER=y
+          CONFIG_AIO=y
+
+          # 04. GUI apps (IPC)
+          CONFIG_SYSVIPC=y
+          CONFIG_SYSVIPC_SYSCTL=y
+          CONFIG_PROC_SYSCTL=y
+          CONFIG_POSIX_MQUEUE=y
+
+          # 05. Docker / cgroups
+          CONFIG_CGROUPS=y
+          CONFIG_CGROUP_DEVICE=y
+          CONFIG_MEMCG=y
+          CONFIG_MEMCG_SWAP=y
+          CONFIG_CGROUP_CPUACCT=y
+          CONFIG_CGROUP_SCHED=y
+          CONFIG_CGROUP_FREEZER=y
+          CONFIG_CGROUP_PIDS=y
+
+          # Optional extras
+          CONFIG_OVERLAY_FS=y
+          CONFIG_FUSE_FS=y
+          CONFIG_BLK_DEV_LOOP=y
+          CONFIG_FW_LOADER=y
+          CONFIG_FW_LOADER_USER_HELPER=y
+          CONFIG_FW_LOADER_COMPRESS=y
+          EOF
+          # remove YAML indentation
+          sed -i 's/^ *//' chroot.config
+          grep -c '^CONFIG_' chroot.config
+
+      - name: Detect defconfig
+        env:
+          DEF_IN: ${{ inputs.defconfig }}
+        run: |
+          if [ -n "$DEF_IN" ]; then
+            DEF="$DEF_IN"
+          else
+            echo "Candidates:"
+            ls arch/arm64/configs | grep -i 9230 || true
+            DEF=$(ls arch/arm64/configs | grep -i 9230 | head -n1 || true)
+          fi
+          if [ -z "$DEF" ]; then
+            echo "::error::لم يتم العثور على defconfig. المتاح:"
+            ls arch/arm64/configs
+            exit 1
+          fi
+          echo "DEFCONFIG=$DEF" >> "$GITHUB_ENV"
+          echo "Using defconfig: $DEF"
+
+      - name: Configure kernel and apply chroot configs
+        env:
+          EXTRA: ${{ inputs.extra_fragments }}
+        run: |
+          export ARCH=arm64
+          MAKE_ARGS="O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabihf-"
+          echo "MAKE_ARGS=$MAKE_ARGS" >> "$GITHUB_ENV"
+
+          make $MAKE_ARGS "$DEFCONFIG"
+
+          # دمج ملفات إضافية (اختياري) ثم ملف الشروت
+          scripts/kconfig/merge_config.sh -m -O out out/.config $EXTRA chroot.config
+          make $MAKE_ARGS olddefconfig
+
+          echo "== Verification ==" | tee config-report.txt
+          MISSING=0
+          while IFS= read -r line; do
+            case "$line" in \#*|"") continue ;; esac
+            sym="${line%%=*}"; want="${line#*=}"
+            got=$(grep -E "^${sym}=" out/.config | cut -d= -f2- || true)
+            if [ "$got" = "$want" ]; then
+              echo "OK    $line" | tee -a config-report.txt
+            elif grep -q "^# ${sym} is not set" out/.config; then
+              echo "OFF   $line (اعتمادية ناقصة)" | tee -a config-report.txt; MISSING=1
+            else
+              echo "N/A   $line (غير موجود في هذا النواة)" | tee -a config-report.txt
+            fi
+          done < chroot.config
+          echo "MISSING=$MISSING" >> "$GITHUB_ENV"
+
+      - name: Enforce strict mode
+        if: ${{ inputs.strict && env.MISSING == '1' }}
+        run: |
+          echo "::error::بعض خيارات الشروت لم تتفعّل، راجع config-report.txt"
+          grep -E '^OFF' config-report.txt || true
+          exit 1
+
+      - name: Build kernel
+        run: |
+          make -j"$(nproc)" $MAKE_ARGS Image.gz 2>&1 | tee build.log
+          make -j"$(nproc)" $MAKE_ARGS dtbs 2>&1 | tee -a build.log || true
+
+      - name: Collect output
+        run: |
+          mkdir -p dist/dtbs
+          cp out/arch/arm64/boot/Image.gz dist/ 2>/dev/null || true
+          cp out/arch/arm64/boot/Image dist/ 2>/dev/null || true
+          find out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} dist/dtbs/ \; 2>/dev/null || true
+          cp out/.config dist/final.config
+          cp config-report.txt chroot.config dist/
+          ls -lh dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kernel-ubuntu-chroot
+          path: |
+            dist/
+            build.log
