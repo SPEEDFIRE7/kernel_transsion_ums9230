@@ -1,0 +1,290 @@
+name: Build Kernel Oppo A15 (CPH2185)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_url:
+        description: 'رابط مصدر النواة (Git URL)'
+        required: true
+        default: 'https://github.com/eun0115/kernel_oppo_CPH2185'
+      kernel_branch:
+        description: 'الفرع (اتركه فارغا للفرع الافتراضي)'
+        required: false
+        default: ''
+      defconfig:
+        description: 'اسم defconfig'
+        required: true
+        default: 'oppo6765_defconfig'
+      clang_branch:
+        description: 'فرع AOSP لـ clang (android10-release)'
+        required: true
+        default: 'android10-release'
+      clang_dir:
+        description: 'مجلد clang داخل المستودع'
+        required: true
+        default: 'clang-r353983c'
+      gcc_branch:
+        description: 'فرع AOSP لـ gcc 4.9'
+        required: true
+        default: 'android10-release'
+      add_ksu:
+        description: 'إضافة KernelSU Next'
+        type: boolean
+        default: false
+      ksu_setup_url:
+        description: 'رابط setup.sh الخاص بـ KernelSU Next'
+        required: false
+        default: 'https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh'
+      ksu_ref:
+        description: 'الفرع/الوسم (legacy لنوى 4.9 غير GKI)'
+        required: false
+        default: 'legacy'
+      extra_make_args:
+        description: 'معاملات make إضافية (اختياري)'
+        required: false
+        default: ''
+
+env:
+  ARCH: arm64
+  SUBARCH: arm64
+  TZ: Asia/Riyadh
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - name: تحرير مساحة القرص
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h /
+
+      - name: تثبيت الأدوات
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev make gcc g++ cpio \
+            git curl wget zip unzip xz-utils lz4 python3 python-is-python3 \
+            device-tree-compiler ccache libncurses-dev dos2unix
+
+      - name: تنزيل مصدر النواة
+        run: |
+          BR=""
+          if [ -n "${{ inputs.kernel_branch }}" ]; then BR="-b ${{ inputs.kernel_branch }}"; fi
+          git clone --depth=1 $BR "${{ inputs.kernel_url }}" kernel
+          cd kernel
+          echo "Commit: $(git log -1 --format='%h %s')"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile | head -3
+
+      - name: تنزيل Clang (AOSP)
+        run: |
+          git clone --depth=1 --filter=blob:none --sparse \
+            -b "${{ inputs.clang_branch }}" \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang-repo
+          cd clang-repo
+          git sparse-checkout set "${{ inputs.clang_dir }}"
+          ls
+          "$PWD/${{ inputs.clang_dir }}/bin/clang" --version
+
+      - name: تنزيل GCC 4.9 (aarch64 + arm)
+        run: |
+          git clone --depth=1 -b "${{ inputs.gcc_branch }}" \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 gcc64
+          git clone --depth=1 -b "${{ inputs.gcc_branch }}" \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 gcc32
+
+      - name: إعداد البيئة
+        run: |
+          echo "$GITHUB_WORKSPACE/clang-repo/${{ inputs.clang_dir }}/bin" >> $GITHUB_PATH
+          echo "$GITHUB_WORKSPACE/gcc64/bin" >> $GITHUB_PATH
+          echo "$GITHUB_WORKSPACE/gcc32/bin" >> $GITHUB_PATH
+          echo "KBUILD_BUILD_USER=builder" >> $GITHUB_ENV
+          echo "KBUILD_BUILD_HOST=github-actions" >> $GITHUB_ENV
+
+      - name: إيجاد defconfig
+        working-directory: kernel
+        run: |
+          DEF="${{ inputs.defconfig }}"
+          if [ -f "arch/arm64/configs/$DEF" ]; then
+            echo "defconfig موجود في arch/arm64/configs"
+          else
+            F=$(find arch -name "$DEF" | head -1)
+            [ -z "$F" ] && { echo "::error::لم يتم العثور على $DEF"; exit 1; }
+            echo "وجد في: $F"
+            cp "$F" arch/arm64/configs/
+          fi
+
+      - name: إضافة KernelSU Next
+        if: ${{ inputs.add_ksu }}
+        working-directory: kernel
+        run: |
+          curl -fLSs "${{ inputs.ksu_setup_url }}" -o ksu_setup.sh \
+            || { echo "::error::الرابط غير صالح (404) — تحقق من ksu_setup_url"; exit 1; }
+          bash ksu_setup.sh "${{ inputs.ksu_ref }}"
+          rm -f ksu_setup.sh
+          ls -d KernelSU* || { echo "::error::فشل إضافة KernelSU"; exit 1; }
+
+          echo "---- فحص Kbuild/Kconfig الخاصة بـ KernelSU-Next ----"
+          grep -n "hook\|HOOK" KernelSU-Next/kernel/Kconfig | head -30 || true
+          grep -n "hook\|HOOK" KernelSU-Next/kernel/Kbuild | head -40 || true
+
+      - name: تطبيق hooks اليدوية (fs/ + reboot)
+        if: ${{ inputs.add_ksu }}
+        working-directory: kernel
+        run: |
+          python3 - <<'PYEOF'
+          import re, sys
+
+          def read(p):
+              return open(p, encoding="utf-8", errors="surrogateescape").read()
+
+          def write(p, s):
+              open(p, "w", encoding="utf-8", errors="surrogateescape").write(s)
+
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+          def insert_before(s, anchor_re, text, start=0, label=""):
+              m = re.compile(anchor_re, re.M).search(s, start)
+              if not m:
+                  fail(f"لم أجد الموضع المناسب ({label}) — عدّل هذا الملف يدويا")
+              return s[:m.start()] + text + s[m.start():], m.start()
+
+          def patch(path, fn):
+              s = read(path)
+              if "ksu_handle" in s:
+                  print(f"[=] {path}: hooks موجودة مسبقا")
+                  return
+              s = fn(s)
+              write(path, s)
+              print(f"[+] {path}: تم")
+
+          # ---------- fs/exec.c ----------
+          def exec_c(s):
+              ext = ("#ifdef CONFIG_KSU\n__attribute__((hot))\n"
+                     "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n"
+                     "\t\t\t\tvoid *argv, void *envp, int *flags);\n#endif\n\n")
+              s, pos = insert_before(s, r"^int do_execve\(struct filename \*filename,", ext, label="do_execve")
+              call = "#ifdef CONFIG_KSU\n\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n#endif\n"
+              ret = "\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);"
+              n = s.count(ret)
+              if n < 1:
+                  fail("لم أجد return do_execveat_common في fs/exec.c")
+              # only hook occurrences after do_execve (do_execve and compat_do_execve)
+              head, tail = s[:pos], s[pos:]
+              tail = tail.replace(ret, call + ret)
+              print(f"    exec.c: {tail.count('ksu_handle_execveat((int')} استدعاء")
+              return head + tail
+
+          # ---------- fs/open.c ----------
+          def open_c(s):
+              ext = ("#ifdef CONFIG_KSU\n__attribute__((hot))\n"
+                     "extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n"
+                     "\t\t\t\tint *mode, int *flags);\n#endif\n\n")
+              s, pos = insert_before(s, r"^SYSCALL_DEFINE3\(faccessat,", ext, label="faccessat")
+              s, _ = insert_before(s, r"^\tif \(mode & ~S_IRWXO\)",
+                  "#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n\n",
+                  start=pos, label="faccessat body")
+              return s
+
+          # ---------- fs/read_write.c ----------
+          def rw_c(s):
+              ext = ("#ifdef CONFIG_KSU\nextern bool ksu_vfs_read_hook __read_mostly;\n"
+                     "extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd,\n"
+                     "\t\t\t\tchar __user **buf_ptr, size_t *count_ptr);\n#endif\n\n")
+              s, pos = insert_before(s, r"^SYSCALL_DEFINE3\(read,", ext, label="sys_read")
+              s, _ = insert_before(s, r"^\tif \(f\.file\) \{",
+                  "#ifdef CONFIG_KSU\n\tif (unlikely(ksu_vfs_read_hook))\n\t\tksu_handle_sys_read(fd, &buf, &count);\n#endif\n",
+                  start=pos, label="sys_read body")
+              return s
+
+          # ---------- fs/stat.c ----------
+          def stat_c(s):
+              ext = ("#ifdef CONFIG_KSU\n__attribute__((hot))\n"
+                     "extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\n"
+                     "\t\t\t\tint *flags);\n#endif\n\n")
+              s, pos = insert_before(s, r"^SYSCALL_DEFINE4\(newfstatat,", ext, label="newfstatat")
+              s, _ = insert_before(s, r"^\terror = vfs_fstatat\(dfd, filename, &stat, flag\);",
+                  "#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flag);\n#endif\n",
+                  start=pos, label="newfstatat body")
+              return s
+
+          # ---------- kernel/reboot.c ----------
+          def reboot_c(s):
+              ext = ("#ifdef CONFIG_KSU\nextern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n#endif\n\n")
+              s, pos = insert_before(s, r"^SYSCALL_DEFINE4\(reboot,", ext, label="reboot")
+              s, _ = insert_before(s, r"^\t/\* We only trust the superuser with rebooting the system\. \*/",
+                  "#ifdef CONFIG_KSU\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif\n",
+                  start=pos, label="reboot body")
+              return s
+
+          patch("fs/exec.c", exec_c)
+          patch("fs/open.c", open_c)
+          patch("fs/read_write.c", rw_c)
+          patch("fs/stat.c", stat_c)
+          patch("kernel/reboot.c", reboot_c)
+          PYEOF
+          git diff --stat || true
+
+      - name: ضبط defconfig لـ KernelSU
+        if: ${{ inputs.add_ksu }}
+        working-directory: kernel
+        run: |
+          DEF=arch/arm64/configs/${{ inputs.defconfig }}
+          sed -i '/CONFIG_KSU/d;/CONFIG_KPROBES/d' "$DEF"
+          {
+            echo ""
+            echo "# KernelSU Next"
+            echo "CONFIG_KSU=y"
+            if grep -q "KSU_MANUAL_HOOK" KernelSU-Next/kernel/Kconfig 2>/dev/null; then
+              echo "CONFIG_KSU_MANUAL_HOOK=y"
+            fi
+            echo "# CONFIG_KPROBES is not set"
+          } >> "$DEF"
+          tail -6 "$DEF"
+
+      - name: بناء النواة
+        working-directory: kernel
+        run: |
+          set -o pipefail
+          MAKE_ARGS=(
+            O=out
+            ARCH=arm64
+            CC=clang
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-android-
+            CROSS_COMPILE_ARM32=arm-linux-androideabi-
+          )
+          make "${MAKE_ARGS[@]}" "${{ inputs.defconfig }}" ${{ inputs.extra_make_args }}
+          make -j$(nproc --all) "${MAKE_ARGS[@]}" ${{ inputs.extra_make_args }} 2>&1 | tee ../build.log
+
+      - name: تجميع الملفات الناتجة
+        if: success()
+        run: |
+          mkdir -p out_files
+          B=kernel/out/arch/arm64/boot
+          for f in Image Image.gz Image.gz-dtb Image-dtb Image.lz4 Image.lz4-dtb; do
+            [ -f "$B/$f" ] && cp "$B/$f" out_files/
+          done
+          find "$B/dts" -name '*.dtb' -exec cp {} out_files/ \; 2>/dev/null || true
+          find "$B/dts" -name '*.dtbo' -exec cp {} out_files/ \; 2>/dev/null || true
+          cp kernel/out/.config out_files/config
+          ls -lh out_files
+          [ -f "$B/Image" ] || { echo "::error::لم يتم إنتاج Image"; exit 1; }
+
+      - name: رفع الناتج
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-oppo-a15
+          path: out_files/*
+
+      - name: رفع سجل البناء
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
